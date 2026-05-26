@@ -45,7 +45,14 @@
     "type": "git",
     "url": "git+https://github.com/dragonsmako/zapros.git"
   },
-  "keywords": [],
+  "keywords": [
+    "fetch",
+    "http",
+    "http-client",
+    "rest",
+    "api",
+    "typescript"
+  ],
   "author": "Rafael Rosenhof",
   "license": "ISC",
   "bugs": {
