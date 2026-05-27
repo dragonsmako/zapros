@@ -88,4 +88,6 @@ export type ZaprosConfig = {
     signal?: AbortSignal;
     /** Request timeout in milliseconds. */
     timeout?: number
+    /** Base URL for the HTTP Request*/
+    baseURL?: string;
 }

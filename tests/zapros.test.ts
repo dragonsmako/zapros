@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import zapros from "../src/zapros.ts";
+import { ZaprosError } from "../src/error.ts";
 
 type FetchMock = ReturnType<typeof vi.fn>;
 
@@ -151,12 +152,15 @@ describe("zapros - response handling", () => {
         );
     });
 
-    it("throws on a 404 without consuming the body", async () => {
-        fetchMock.mockResolvedValueOnce(new Response("missing", { status: 404, statusText: "Not Found" }));
-
-        await expect(zapros.get("https://api.test/missing")).rejects.toThrow(
-            "Request failed: 404 Not Found",
+    it("captures the error body on a 404", async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response("missing", { status: 404, statusText: "Not Found", headers: { "content-type": "text/plain" } }),
         );
+
+        const err = await zapros.get("https://api.test/missing").catch((e) => e);
+        expect(err).toBeInstanceOf(ZaprosError);
+        expect(err.message).toBe("Request failed: 404 Not Found");
+        expect(err.data).toBe("missing");
     });
 });
 
@@ -248,10 +252,148 @@ describe("zapros - headers and config", () => {
         expect("signal" in init).toBe(false);
     });
 
-    it("propagates fetch rejection (e.g. aborted request)", async () => {
+    it("wraps a fetch abort as ZaprosError with code ERR_ABORTED", async () => {
         const abortErr = new DOMException("The operation was aborted.", "AbortError");
         fetchMock.mockRejectedValueOnce(abortErr);
 
-        await expect(zapros.get("https://api.test/s")).rejects.toBe(abortErr);
+        const err = await zapros.get("https://api.test/s").catch((e) => e);
+        expect(err).toBeInstanceOf(ZaprosError);
+        expect(err.code).toBe("ERR_ABORTED");
+        expect(err.cause).toBe(abortErr);
+    });
+
+    it("prepends config.baseURL to the request URL", async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({}));
+
+        await zapros.get("/users", { baseURL: "https://api.test" });
+
+        const [url] = fetchMock.mock.calls[0]!;
+        expect(url).toBe("https://api.test/users");
+    });
+
+    it("falls back to defaults.baseURL", async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({}));
+        zapros.defaults = { baseURL: "https://api.test" };
+
+        await zapros.get("/users");
+
+        const [url] = fetchMock.mock.calls[0]!;
+        expect(url).toBe("https://api.test/users");
+    });
+});
+
+describe("zapros - request body variety", () => {
+    it.each([
+        ["FormData", () => { const f = new FormData(); f.append("a", "1"); return f; }],
+        ["URLSearchParams", () => new URLSearchParams({ a: "1" })],
+        ["Blob", () => new Blob(["hi"], { type: "text/plain" })],
+        ["ArrayBuffer", () => new ArrayBuffer(8)],
+        ["Uint8Array", () => new Uint8Array([1, 2, 3])],
+    ] as const)("passes %s through untouched and sets no Content-Type", async (_label, make) => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({}));
+        const body = make();
+
+        await zapros.post("https://api.test/upload", body);
+
+        const [, init] = fetchMock.mock.calls[0]!;
+        expect(init.body).toBe(body);
+        expect(init.headers["Content-Type"]).toBeUndefined();
+    });
+
+    it("sends a string body as-is without forcing JSON", async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({}));
+
+        await zapros.post("https://api.test/raw", "plain string");
+
+        const [, init] = fetchMock.mock.calls[0]!;
+        expect(init.body).toBe("plain string");
+        expect(init.headers["Content-Type"]).toBeUndefined();
+    });
+
+    it("still JSON-encodes plain objects and arrays", async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({}));
+
+        await zapros.post("https://api.test/json", [1, 2, 3]);
+
+        const [, init] = fetchMock.mock.calls[0]!;
+        expect(init.body).toBe("[1,2,3]");
+        expect(init.headers["Content-Type"]).toBe("application/json");
+    });
+});
+
+describe("zapros - timeout", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    function abortableFetch() {
+        return vi.fn((_url: string, init: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+                init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+            }),
+        );
+    }
+
+    it("rejects with ERR_TIMEOUT once the timeout elapses", async () => {
+        fetchMock = abortableFetch();
+        vi.stubGlobal("fetch", fetchMock);
+
+        const promise = zapros.get("https://api.test/slow", { timeout: 1000 });
+        const expectation = expect(promise).rejects.toMatchObject({
+            name: "ZaprosError",
+            code: "ERR_TIMEOUT",
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        await expectation;
+    });
+
+    it("clears the timer when the response arrives first", async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+        const result = await zapros.get("https://api.test/fast", { timeout: 1000 });
+
+        expect(result.data).toEqual({ ok: true });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("aborts via the caller's signal before the timeout (ERR_ABORTED)", async () => {
+        fetchMock = abortableFetch();
+        vi.stubGlobal("fetch", fetchMock);
+        const controller = new AbortController();
+
+        const promise = zapros.get("https://api.test/slow", { timeout: 10_000, signal: controller.signal });
+        const expectation = expect(promise).rejects.toMatchObject({ code: "ERR_ABORTED" });
+        controller.abort();
+        await expectation;
+    });
+});
+
+describe("ZaprosError", () => {
+    it("is thrown with full HTTP context on a non-2xx JSON response", async () => {
+        fetchMock.mockResolvedValueOnce(
+            jsonResponse({ message: "boom" }, { status: 422, statusText: "Unprocessable Entity" }),
+        );
+
+        const err = await zapros.post("https://api.test/items", { x: 1 }).catch((e) => e);
+
+        expect(err).toBeInstanceOf(ZaprosError);
+        expect(err.code).toBe("ERR_HTTP");
+        expect(err.status).toBe(422);
+        expect(err.statusText).toBe("Unprocessable Entity");
+        expect(err.data).toEqual({ message: "boom" });
+        expect(err.url).toBe("https://api.test/items");
+        expect(err.method).toBe("POST");
+        expect(err.response).toBeInstanceOf(Response);
+    });
+
+    it("wraps a network failure as ERR_NETWORK preserving the cause", async () => {
+        const netErr = new TypeError("Failed to fetch");
+        fetchMock.mockRejectedValueOnce(netErr);
+
+        const err = await zapros.get("https://api.test/down").catch((e) => e);
+
+        expect(err).toBeInstanceOf(ZaprosError);
+        expect(err.code).toBe("ERR_NETWORK");
+        expect(err.cause).toBe(netErr);
+        expect(err.status).toBeUndefined();
     });
 });

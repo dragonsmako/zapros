@@ -1,4 +1,24 @@
 import type { Zapros, ZaprosConfig, ZaprosResult } from "./types.ts";
+import { ZaprosError } from "./error.ts";
+
+// Body types fetch can send as-is; anything else is treated as JSON.
+function isRawBody(data: unknown): data is BodyInit {
+    return (
+        typeof data === "string" ||
+        data instanceof FormData ||
+        data instanceof URLSearchParams ||
+        data instanceof Blob ||
+        data instanceof ArrayBuffer ||
+        ArrayBuffer.isView(data) ||
+        data instanceof ReadableStream
+    );
+}
+
+// Parse a response body as JSON when it claims to be, otherwise as text.
+async function parseBody(res: Response): Promise<unknown> {
+    const contentType = res.headers.get("content-type") ?? "";
+    return contentType.includes("application/json") ? await res.json() : await res.text();
+}
 
 async function request<T>(
     method: string,
@@ -9,35 +29,93 @@ async function request<T>(
 ): Promise<ZaprosResult<T>> {
     const headers = { ...defaults.headers, ...config.headers };
     const credentials = config.credentials ?? defaults.credentials;
+    const timeout = config.timeout ?? defaults.timeout;
+    const userSignal = config.signal;
+
+    // Combine an optional timeout with an optional caller signal: either one
+    // aborts the request. The timer is cleared in `finally` so a fast response
+    // doesn't leave a pending timeout holding the event loop open.
+    let signal = userSignal;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    if (timeout !== undefined) {
+        const controller = new AbortController();
+        signal = controller.signal;
+        timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort(new DOMException("Request timed out", "TimeoutError"));
+        }, timeout);
+        if (userSignal) {
+            if (userSignal.aborted) controller.abort(userSignal.reason);
+            else userSignal.addEventListener("abort", () => controller.abort(userSignal.reason), { once: true });
+        }
+    }
 
     const init: RequestInit = {
         method,
         headers,
         ...(credentials !== undefined && { credentials }),
-        ...(config.signal !== undefined && { signal: config.signal }),
+        ...(signal !== undefined && { signal }),
     };
 
     if (data !== undefined) {
-        init.body = JSON.stringify(data);
-        if (!headers["Content-Type"]) {
-            headers["Content-Type"] = "application/json";
+        if (isRawBody(data)) {
+            // Pass through untouched so fetch can set the right Content-Type
+            // (e.g. the multipart boundary for FormData).
+            init.body = data;
+        } else {
+            init.body = JSON.stringify(data);
+            if (!headers["Content-Type"]) {
+                headers["Content-Type"] = "application/json";
+            }
         }
     }
 
-    const res = await fetch(url, init);
+    const baseURL = config.baseURL ?? defaults.baseURL ?? "";
+    const fullUrl = baseURL + url;
 
-    if (!res.ok) {
-        throw new Error(`Request failed: ${res.status} ${res.statusText}`);
+    let res: Response;
+    try {
+        res = await fetch(fullUrl, init);
+    } catch (err) {
+        if (timedOut) {
+            throw new ZaprosError(`Request to ${fullUrl} timed out after ${timeout}ms`, {
+                code: "ERR_TIMEOUT", url: fullUrl, method, cause: err,
+            });
+        }
+        if (err instanceof Error && err.name === "AbortError") {
+            throw new ZaprosError(`Request to ${fullUrl} was aborted`, {
+                code: "ERR_ABORTED", url: fullUrl, method, cause: err,
+            });
+        }
+        throw new ZaprosError(`Request to ${fullUrl} failed: ${(err as Error).message}`, {
+            code: "ERR_NETWORK", url: fullUrl, method, cause: err,
+        });
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
     }
 
-    // Handle empty bodies and non-JSON gracefully
-    const contentType = res.headers.get("content-type") ?? "";
-    const body = contentType.includes("application/json")
-        ? await res.json()
-        : await res.text();
+    if (!res.ok) {
+        // Capture the error body when present so callers can inspect it.
+        let errorData: unknown;
+        try {
+            errorData = await parseBody(res);
+        } catch {
+            errorData = undefined;
+        }
+        throw new ZaprosError<T>(`Request failed: ${res.status} ${res.statusText}`, {
+            code: "ERR_HTTP",
+            url: fullUrl,
+            method,
+            status: res.status,
+            statusText: res.statusText,
+            data: errorData as T,
+            response: res,
+        });
+    }
 
     return {
-        data: body as T,
+        data: (await parseBody(res)) as T,
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,
