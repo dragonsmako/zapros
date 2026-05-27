@@ -44,6 +44,24 @@ async function request<T>(
     };
 }
 
+/**
+ * The default zapros client.
+ *
+ * A ready-to-use {@link Zapros} instance exposing `get`, `post`, `put`,
+ * `patch`, and `delete`. Each method builds on the platform `fetch`, sends
+ * JSON bodies by default, and rejects on non-2xx responses.
+ *
+ * @example
+ * ```ts
+ * import zapros from "@dragonsmako/zapros";
+ *
+ * type User = { id: number; name: string };
+ * const { data, status } = await zapros.get<User>("https://api.example.com/users/1");
+ *
+ * // Change defaults applied to every request:
+ * zapros.defaults.credentials = "same-origin";
+ * ```
+ */
 const zapros: Zapros = {
     get:    (url, config) => request("GET",    url, undefined, config, zapros.defaults),
     post:   (url, data, config) => request("POST",   url, data, config, zapros.defaults),
