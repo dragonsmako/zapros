@@ -146,6 +146,9 @@ class ZaprosError<T = unknown> extends Error {
   cause?: unknown;        // underlying error for timeout/abort/network
 }
 ```
+#### TODO
+- Expand error handling (401, 403, 404, 410, 409, 422, 429)
+
 
 ### Body handling
 
