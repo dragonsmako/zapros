@@ -1,7 +1,6 @@
 import type { Zapros, ZaprosConfig, ZaprosResult } from "./types.ts";
 import { ZaprosError } from "./error.ts";
 
-// Body types fetch can send as-is; anything else is treated as JSON.
 function isRawBody(data: unknown): data is BodyInit {
     return (
         typeof data === "string" ||
@@ -14,7 +13,6 @@ function isRawBody(data: unknown): data is BodyInit {
     );
 }
 
-// Parse a response body as JSON when it claims to be, otherwise as text.
 async function parseBody(res: Response): Promise<unknown> {
     const contentType = res.headers.get("content-type") ?? "";
     return contentType.includes("application/json") ? await res.json() : await res.text();
@@ -32,9 +30,6 @@ async function request<T>(
     const timeout = config.timeout ?? defaults.timeout;
     const userSignal = config.signal;
 
-    // Combine an optional timeout with an optional caller signal: either one
-    // aborts the request. The timer is cleared in `finally` so a fast response
-    // doesn't leave a pending timeout holding the event loop open.
     let signal = userSignal;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
@@ -60,19 +55,19 @@ async function request<T>(
 
     if (data !== undefined) {
         if (isRawBody(data)) {
-            // Pass through untouched so fetch can set the right Content-Type
-            // (e.g. the multipart boundary for FormData).
             init.body = data;
         } else {
             init.body = JSON.stringify(data);
-            if (!headers["Content-Type"]) {
-                headers["Content-Type"] = "application/json";
-            }
+
+            const hasContentType = Object.keys(headers).some(k => k.toLowerCase() === "content-type");
+
+            if (!hasContentType) headers["Content-Type"] = "application/json";
+
         }
     }
 
     const baseURL = config.baseURL ?? defaults.baseURL ?? "";
-    const fullUrl = baseURL + url;
+    const fullUrl = baseURL ? new URL(url, baseURL).toString() : url;
 
     let res: Response;
     try {
@@ -96,13 +91,14 @@ async function request<T>(
     }
 
     if (!res.ok) {
-        // Capture the error body when present so callers can inspect it.
         let errorData: unknown;
+
         try {
-            errorData = await parseBody(res);
+            errorData = await parseBody(res.clone());
         } catch {
             errorData = undefined;
         }
+
         throw new ZaprosError<T>(`Request failed: ${res.status} ${res.statusText}`, {
             code: "ERR_HTTP",
             url: fullUrl,
@@ -114,8 +110,18 @@ async function request<T>(
         });
     }
 
+    let parsed: T;
+
+    try {
+        parsed = (await parseBody(res) as T);
+    } catch (err) {
+        throw new ZaprosError(`Failed to parse response from ${fullUrl}`, {
+            code: "ERR_PARSE", url: fullUrl, method, response: res, cause: err,
+        });
+    }
+
     return {
-        data: (await parseBody(res)) as T,
+        data: parsed,
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,

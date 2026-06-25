@@ -6,7 +6,7 @@
  * - `ERR_ABORTED` — the caller's `AbortSignal` aborted the request.
  * - `ERR_NETWORK` — `fetch` itself failed (DNS, connection refused, CORS, …).
  */
-export type ZaprosErrorCode = "ERR_HTTP" | "ERR_TIMEOUT" | "ERR_ABORTED" | "ERR_NETWORK";
+export type ZaprosErrorCode = "ERR_HTTP" | "ERR_TIMEOUT" | "ERR_ABORTED" | "ERR_NETWORK" | "ERR_PARSE";
 
 /** Fields used to construct a {@link ZaprosError}. */
 export interface ZaprosErrorInit<T = unknown> {
